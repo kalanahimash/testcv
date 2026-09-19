@@ -26,13 +26,18 @@ def detection_demo():
     if not camera_lock.acquire(blocking=False):
         return jsonify(error="Stop the camera before running the sample test."), 409
     try:
-        from detector import get_model
-        get_model()
-        from ultralytics.utils import ASSETS
-        sample = cv2.imread(str(ASSETS / "bus.jpg"))
+        sign_demo = request.args.get("signs", "0") == "1"
+        if sign_demo:
+            from sign_samples import sample_board
+            sample = sample_board()
+        else:
+            from detector import get_model
+            get_model()
+            from ultralytics.utils import ASSETS
+            sample = cv2.imread(str(ASSETS / "bus.jpg"))
         if sample is None:
             raise RuntimeError("Bundled sample image is missing")
-        annotated = annotate(sample, 0.25)
+        annotated = annotate(sample, 0.25, signs=sign_demo, objects=not sign_demo)
         ok, jpeg = cv2.imencode(".jpg", annotated)
         if not ok:
             raise RuntimeError("Could not encode sample image")
@@ -50,6 +55,13 @@ def index():
     return render_template("index.html")
 
 
+@app.get("/sign-test-card")
+def sign_test_card():
+    from sign_samples import sample_board
+    ok, jpeg = cv2.imencode(".jpg", sample_board())
+    return Response(jpeg.tobytes(), mimetype="image/jpeg")
+
+
 @app.get("/stream")
 def stream():
     try:
@@ -60,6 +72,8 @@ def stream():
         return jsonify(error="Camera number must be between 0 and 10."), 400
 
     detect = request.args.get("detect", "0") == "1"
+    signs = request.args.get("signs", "0") == "1"
+    processing = detect or signs
     try:
         confidence = float(request.args.get("confidence", "0.25"))
         if not math.isfinite(confidence) or not 0.1 <= confidence <= 0.9:
@@ -82,27 +96,29 @@ def stream():
             camera_lock.release()
 
     try:
-        # Select the Windows webcam backend explicitly. CAP_ANY may select a
-        # backend that cannot enumerate cameras even when DirectShow works.
-        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-        capture = cv2.VideoCapture(camera_index, backend)
+        # Try multiple backends (DirectShow, MSMF, and ANY) for robust USB webcam support on Windows
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY] if sys.platform == "win32" else [cv2.CAP_ANY]
+        for b in backends:
+            capture = cv2.VideoCapture(camera_index, b)
+            if capture.isOpened():
+                break
         if not capture.isOpened():
             cleanup()
-            return jsonify(error="Cannot open camera. Check camera number, Windows camera permissions, and other apps using it."), 503
+            return jsonify(error=f"Cannot open camera {camera_index}. If you plugged in a USB webcam or disabled your built-in webcam, please select '1 · USB / External camera' from the Camera dropdown."), 503
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         ok, first_frame = capture.read()
         if not ok:
             cleanup()
-            return jsonify(error="Camera opened but did not provide an image."), 503
+            return jsonify(error=f"Camera {camera_index} opened but did not provide an image. Try another camera index in the dropdown."), 503
     except Exception:
         cleanup()
         app.logger.exception("Camera initialization failed")
         return jsonify(error="Camera initialization failed. See the Python terminal for details."), 503
 
-    if detect:
+    if processing:
         try:
-            first_frame = annotate(first_frame, confidence)
+            first_frame = annotate(first_frame, confidence, signs=signs, objects=detect)
         except Exception as error:
             cleanup()
             app.logger.exception("Detection initialization failed")
@@ -117,18 +133,18 @@ def stream():
                 if not ok:
                     break
                 data = encoded.tobytes()
-                metadata = ("X-Detection: " + ("on" if detect else "off") + "\r\n"
-                            + "X-Detection-Result: " + json.dumps(detection_status() if detect else {})
+                metadata = ("X-Detection: " + ("on" if processing else "off") + "\r\n"
+                            + "X-Detection-Result: " + json.dumps(detection_status() if processing else {})
                             + "\r\n").encode("ascii")
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                        + str(len(data)).encode() + b"\r\n" + metadata + b"\r\n" + data + b"\r\n")
-                if not detect:
+                if not processing:
                     time.sleep(max(0, 1 / 30 - (time.monotonic() - started)))
                 ok, frame = capture.read()
                 if not ok:
                     break
-                if detect:
-                    frame = annotate(frame, confidence)
+                if processing:
+                    frame = annotate(frame, confidence, signs=signs, objects=detect)
         except Exception:
             app.logger.exception("Camera stream or detection failed")
         finally:

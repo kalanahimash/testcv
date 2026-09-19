@@ -86,6 +86,25 @@ class CameraTests(unittest.TestCase):
         finally:
             camera_lock.release()
 
+    def test_speed_sign_50_kmph_detection(self):
+        from sign_samples import speed_card
+        from sign_detector import detect_speed_signs
+        card = speed_card(50, unit="kmph", size=320)
+        detections = detect_speed_signs(card)
+        self.assertTrue(len(detections) >= 1)
+        self.assertEqual(detections[0]["speed"], 50)
+        self.assertIn("50", detections[0]["name"])
+
+    def test_stop_sign_validation(self):
+        from sign_detector import is_actual_stop_sign
+        from sign_samples import speed_card
+        speed = speed_card(50, unit="kmph", size=320)
+        self.assertFalse(is_actual_stop_sign(speed))
+
+        stop_solid = np.full((320, 320, 3), 240, dtype=np.uint8)
+        cv2.circle(stop_solid, (160, 160), 130, (0, 0, 220), -1)
+        self.assertTrue(is_actual_stop_sign(stop_solid))
+
 
 if __name__ == '__main__':
     unittest.main()

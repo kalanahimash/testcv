@@ -10,12 +10,19 @@ const status = document.querySelector('#status');
 const indicator = document.querySelector('#indicator');
 const detectionResult = document.querySelector('#detection-result');
 const demo = document.querySelector('#demo');
+const signs = document.querySelector('#signs');
+const signDemo = document.querySelector('#sign-demo');
+const signResult = document.querySelector('#sign-result');
 let controller = null;
 
 function showDetections(enabled, result) {
   detectionResult.textContent = enabled
     ? `Detection running · ${result.count} object(s) · ${result.fps} inference FPS. ${result.labels.length ? result.labels.join(', ') : 'No objects found: try better front lighting or a lower confidence threshold.'}`
     : 'Detection is OFF. Stop the camera and check Detect road objects to enable it.';
+  const signLabels = (result.signs || []).map(item => `${item.name} ${Math.round(item.confidence * 100)}%`);
+  signResult.textContent = result.signs_enabled
+    ? `Sign detector running · ${signLabels.length ? signLabels.join(', ') : 'No recognized signs in this frame.'}`
+    : 'Sign detection is OFF.';
 }
 
 function message(text, error = false) {
@@ -31,6 +38,8 @@ function reset() {
   detect.disabled = false;
   confidence.disabled = false;
   demo.disabled = false;
+  signs.disabled = false;
+  signDemo.disabled = false;
   indicator.textContent = '● OFFLINE';
   indicator.classList.remove('live');
 }
@@ -51,11 +60,13 @@ start.addEventListener('click', async () => {
   detect.disabled = true;
   confidence.disabled = true;
   demo.disabled = true;
+  signs.disabled = true;
+  signDemo.disabled = true;
   stop.disabled = false;
-  message(detect.checked ? 'Opening camera and loading detection model…' : 'Opening camera…');
+  message(detect.checked || signs.checked ? 'Opening camera and loading detection models…' : 'Opening camera…');
   detectionResult.textContent = 'Waiting for the first processed frame…';
   try {
-    const response = await fetch(`/stream?camera=${camera.value}&detect=${detect.checked ? 1 : 0}&confidence=${confidence.value}`, {signal: session.signal});
+    const response = await fetch(`/stream?camera=${camera.value}&detect=${detect.checked ? 1 : 0}&signs=${signs.checked ? 1 : 0}&confidence=${confidence.value}`, {signal: session.signal});
     if (!response.ok) {
       const detail = await response.json();
       throw new Error(detail.error || 'Could not start camera.');
@@ -81,7 +92,8 @@ start.addEventListener('click', async () => {
         const detectionMode = /X-Detection:\s*(on|off)/i.exec(header);
         const detectionData = /X-Detection-Result:\s*([^\r\n]+)/i.exec(header);
         if (!detectionMode || !detectionData) throw new Error('An older server is streaming. Stop all copies of app.py, restart it, then refresh this page.');
-        if (detect.checked && detectionMode[1] !== 'on') throw new Error('The server did not enable detection. Restart app.py and retry.');
+        if ((detect.checked || signs.checked) && detectionMode[1] !== 'on') throw new Error('The server did not enable detection. Restart app.py and retry.');
+        if (signs.checked && !JSON.parse(detectionData[1]).signs_enabled) throw new Error('This server has not enabled sign detection. Restart app.py and refresh.');
         const match = /Content-Length:\s*(\d+)/i.exec(header);
         if (!match) throw new Error('Invalid camera stream.');
         const length = Number(match[1]);
@@ -108,6 +120,7 @@ start.addEventListener('click', async () => {
     if (session.signal.aborted) message('Camera is off.');
     else message(error.message, true);
     detectionResult.textContent = session.signal.aborted ? 'Detection stopped.' : 'Detection interrupted. See the message below.';
+    signResult.textContent = 'Sign detection stopped.';
   } finally {
     session.abort();
     controller = null;
@@ -115,13 +128,14 @@ start.addEventListener('click', async () => {
   }
 });
 
-demo.addEventListener('click', async () => {
+async function runDemo(testSigns = false) {
   reset();
   demo.disabled = true;
+  signDemo.disabled = true;
   start.disabled = true;
-  message('Running detection on the bundled road sample…');
+  message(testSigns ? 'Testing crossing-sign recognition and speed-number reading…' : 'Running detection on the bundled road sample…');
   try {
-    const response = await fetch('/detection-demo');
+    const response = await fetch(`/detection-demo?signs=${testSigns ? 1 : 0}`);
     if (!response.ok) {
       const detail = await response.json();
       throw new Error(detail.error || 'Sample test failed.');
@@ -136,12 +150,15 @@ demo.addEventListener('click', async () => {
     placeholder.hidden = true;
     indicator.textContent = 'SAMPLE TEST';
     showDetections(true, result);
-    message(`Sample test complete: ${result.count} objects. This is a test photo, not the live camera.`);
+    message(`Sample test complete: ${result.count} detections. ${testSigns ? 'These are synthetic test signs, not road validation images.' : 'This is a test photo, not the live camera.'}`);
   } catch (error) {
     message(error.message, true);
     detectionResult.textContent = 'Sample test failed.';
   } finally {
     demo.disabled = false;
+    signDemo.disabled = false;
     start.disabled = false;
   }
-});
+}
+demo.addEventListener('click', () => runDemo(false));
+signDemo.addEventListener('click', () => runDemo(true));

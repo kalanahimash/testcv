@@ -31,18 +31,56 @@ def get_model():
     return _model
 
 
-def annotate(frame, confidence=0.25):
+def annotate(frame, confidence=0.25, signs=False, objects=True):
     global _status
-    model = get_model()
     started = time.perf_counter()
-    result = model.predict(frame, conf=confidence, classes=ROAD_CLASSES,
-                           imgsz=640, device="cpu", verbose=False, save=False)[0]
-    annotated = result.plot(line_width=2, font_size=14)
+    labels = []
+    annotated = frame.copy()
+    sign_results = []
+    if signs:
+        from sign_detector import detect_signs, draw_signs
+        sign_results = detect_signs(frame, max(confidence, 0.35))
+        draw_signs(annotated, sign_results)
+        labels.extend(f'{item["name"]} {item["confidence"]:.0%}' for item in sign_results)
+
+    if objects:
+        model = get_model()
+        result = model.predict(frame, conf=confidence, classes=ROAD_CLASSES,
+                               imgsz=640, device="cpu", verbose=False, save=False)[0]
+        from sign_detector import is_actual_stop_sign, box_iou
+        speed_boxes = [s["box"] for s in sign_results]
+        
+        for box in result.boxes:
+            cls_id = int(box.cls.item())
+            cls_name = result.names[cls_id]
+            conf_val = float(box.conf.item())
+            b = [int(n) for n in box.xyxy[0].tolist()]
+            x1, y1, x2, y2 = b
+            crop = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+
+            if cls_name == "stop sign":
+                # Suppress if overlaps with any detected road/speed sign or if interior is not solid red
+                if any(box_iou(b, sbox) > 0.20 for sbox in speed_boxes):
+                    continue
+                if not is_actual_stop_sign(crop):
+                    continue
+
+            # Draw road object bounding box
+            color = (80, 220, 100) if cls_name == "person" else (220, 140, 60)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            label = f"{cls_name} {conf_val:.0%}"
+            (w_t, h_t), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            ty = max(h_t + 4, y1 - 4)
+            tx = max(0, min(x1, annotated.shape[1] - w_t - 4))
+            cv2.rectangle(annotated, (tx, ty - h_t - 2), (tx + w_t + 4, ty + baseline), color, -1)
+            cv2.putText(annotated, label, (tx + 2, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (10, 15, 20), 1, cv2.LINE_AA)
+            labels.append(label)
+
     duration = time.perf_counter() - started
-    count = len(result.boxes)
-    labels = [f"{result.names[int(box.cls.item())]} {float(box.conf.item()):.0%}"
-              for box in result.boxes]
-    _status = {"count": count, "labels": labels, "fps": round(1 / max(duration, 0.001), 1)}
+    count = len(labels)
+    _status = {"count": count, "labels": labels, "fps": round(1 / max(duration, 0.001), 1),
+               "signs_enabled": signs, "objects_enabled": objects,
+               "signs": sign_results, "speed_limits": [s["speed"] for s in sign_results if "speed" in s]}
     text = f"ROAD DETECTION | {count} objects | {1 / max(duration, 0.001):.1f} inference FPS"
     cv2.rectangle(annotated, (0, 0), (annotated.shape[1], 34), (20, 32, 40), -1)
     cv2.putText(annotated, text, (12, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
