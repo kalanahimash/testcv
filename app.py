@@ -4,6 +4,7 @@ import argparse
 import math
 import json
 import sys
+import queue
 import threading
 import time
 
@@ -86,11 +87,13 @@ def stream():
 
     capture = None
     released = False
+    stop_event = threading.Event()  # shared signal: tells all threads and generator to stop
 
     def cleanup():
         nonlocal released
         if not released:
             released = True
+            stop_event.set()          # wake any blocked queue.get() immediately
             if capture is not None:
                 capture.release()
             camera_lock.release()
@@ -125,26 +128,92 @@ def stream():
             return jsonify(error=f"Detection could not start: {error}. You can turn off Detect road objects to use the camera alone."), 503
 
     def frames():
-        frame = first_frame
+        # ── Stage 1: camera capture thread ─────────────────────────────────────
+        # Reads frames as fast as the sensor allows; always keeps only the newest.
+        raw_q = queue.Queue(maxsize=1)
+
+        def _capture_worker():
+            while not stop_event.is_set():
+                ok, raw = capture.read()
+                if not ok:
+                    stop_event.set()   # camera disconnected – signal everyone
+                    break
+                # Drop the stale queued frame, replace with this newer one
+                try:
+                    raw_q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    raw_q.put_nowait(raw)
+                except queue.Full:
+                    pass
+
+        # ── Stage 2: inference thread ───────────────────────────────────────────
+        # Runs YOLO + OCR on a background thread; never blocks the camera or stream.
+        result_q = queue.Queue(maxsize=2)
+
+        def _inference_worker():
+            while not stop_event.is_set():
+                try:
+                    raw = raw_q.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                try:
+                    ann = annotate(raw, confidence, signs=signs, objects=detect)
+                    sts = detection_status()
+                    # Keep only the freshest annotated frame
+                    try:
+                        result_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        result_q.put_nowait((ann, sts))
+                    except queue.Full:
+                        pass
+                except Exception:
+                    app.logger.exception("Inference failed in worker thread")
+
+        # Start background workers
+        threading.Thread(target=_capture_worker, daemon=True, name="cam-capture").start()
+        if processing:
+            threading.Thread(target=_inference_worker, daemon=True, name="cam-inference").start()
+
+        # ── Stage 3: stream generator ───────────────────────────────────────────
+        # Yields the latest available frame immediately; never waits for inference.
+        current_frame = first_frame
+        current_status = detection_status() if processing else {}
+        first = True   # yield the pre-annotated first_frame without waiting
+
         try:
-            while True:
+            while not stop_event.is_set():
                 started = time.monotonic()
-                ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+
+                if not first:
+                    if processing:
+                        try:
+                            current_frame, current_status = result_q.get(timeout=0.25)
+                        except queue.Empty:
+                            continue           # no new annotated frame yet; spin
+                    else:
+                        try:
+                            current_frame = raw_q.get(timeout=0.25)
+                            current_status = {}
+                        except queue.Empty:
+                            continue
+                        # Maintain ~30 fps cap for raw (non-inference) mode
+                        elapsed = time.monotonic() - started
+                        time.sleep(max(0, 1 / 30 - elapsed))
+                first = False
+
+                ok, encoded = cv2.imencode(".jpg", current_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if not ok:
                     break
                 data = encoded.tobytes()
                 metadata = ("X-Detection: " + ("on" if processing else "off") + "\r\n"
-                            + "X-Detection-Result: " + json.dumps(detection_status() if processing else {})
+                            + "X-Detection-Result: " + json.dumps(current_status)
                             + "\r\n").encode("ascii")
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                        + str(len(data)).encode() + b"\r\n" + metadata + b"\r\n" + data + b"\r\n")
-                if not processing:
-                    time.sleep(max(0, 1 / 30 - (time.monotonic() - started)))
-                ok, frame = capture.read()
-                if not ok:
-                    break
-                if processing:
-                    frame = annotate(frame, confidence, signs=signs, objects=detect)
         except Exception:
             app.logger.exception("Camera stream or detection failed")
         finally:

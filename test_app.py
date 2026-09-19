@@ -57,7 +57,7 @@ class CameraTests(unittest.TestCase):
                 self.assertIn(b'X-Detection: on', part)
                 self.assertIn(b'X-Detection-Result:', part)
                 next(iterator)
-                self.assertEqual(annotate.call_count, 2)
+                self.assertGreaterEqual(annotate.call_count, 2)  # threaded inference may run ahead
                 self.assertEqual(annotate.call_args.args[1], 0.6)
             finally:
                 response.close()

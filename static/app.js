@@ -55,6 +55,8 @@ window.addEventListener('pagehide', () => controller?.abort());
 start.addEventListener('click', async () => {
   const session = new AbortController();
   controller = session;
+  let drawBitmap = null;   // holds latest decoded ImageBitmap waiting for next vsync
+  let rafPending = false;  // true while a requestAnimationFrame is already queued
   start.disabled = true;
   camera.disabled = true;
   detect.disabled = true;
@@ -105,9 +107,22 @@ start.addEventListener('click', async () => {
           preview.width = frame.width;
           preview.height = frame.height;
         }
-        context.drawImage(frame, 0, 0);
+        // Swap in the newest decoded frame; drop the previous one if it wasn't drawn yet
+        if (drawBitmap) { drawBitmap.close(); drawBitmap = null; }
+        drawBitmap = frame;
+        // Schedule exactly one draw per vsync cycle – always paints the freshest bitmap
+        if (!rafPending) {
+          rafPending = true;
+          requestAnimationFrame(() => {
+            rafPending = false;
+            if (drawBitmap && !session.signal.aborted) {
+              context.drawImage(drawBitmap, 0, 0);
+              drawBitmap.close();
+              drawBitmap = null;
+            }
+          });
+        }
         showDetections(detectionMode[1] === 'on', JSON.parse(detectionData[1]));
-        frame.close();
         buffer = buffer.slice(end);
         preview.hidden = false;
         placeholder.hidden = true;
@@ -122,6 +137,7 @@ start.addEventListener('click', async () => {
     detectionResult.textContent = session.signal.aborted ? 'Detection stopped.' : 'Detection interrupted. See the message below.';
     signResult.textContent = 'Sign detection stopped.';
   } finally {
+    if (drawBitmap) { drawBitmap.close(); drawBitmap = null; }  // release any undisplayed frame
     session.abort();
     controller = null;
     reset();
